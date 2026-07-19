@@ -102,12 +102,26 @@ struct ContentView: View {
             Spacer(minLength: 0)
         }
         .padding(20)
+        // ウィンドウを常に最前面（フローティング）に固定する
+        .background(WindowConfigurator())
         // ウィンドウ全体でドラッグ&ドロップを受け付ける
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             handleDrop(providers)
         }
+        // Finder の「このアプリで開く」や Parallels からファイルが渡されると呼ばれる。
+        // 起動直後・起動済みのどちらでも受け取れる。
+        .onOpenURL { url in
+            bringToFront()
+            if isVideoFile(url) {
+                loadVideo(url)
+            } else {
+                isError = true
+                statusMessage = "動画ファイルではありません: \(url.lastPathComponent)"
+            }
+        }
         .onAppear {
             installKeyMonitor()
+            bringToFront()
         }
         .onDisappear {
             teardownPlaybackObservers()
@@ -246,6 +260,13 @@ struct ContentView: View {
         if panel.runModal() == .OK, let url = panel.url {
             loadVideo(url)
         }
+    }
+
+    /// 起動・ファイル受け取り時にアプリを最前面へ出す。
+    /// Parallels 経由で起動すると背面に隠れることがあるため。
+    private func bringToFront() {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        NSApplication.shared.windows.first?.makeKeyAndOrderFront(nil)
     }
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
@@ -485,5 +506,28 @@ struct ContentView: View {
         let secs = (totalMillis % 60000) / 1000
         let millis = totalMillis % 1000
         return String(format: "%02d:%02d.%03d", minutes, secs, millis)
+    }
+}
+
+/// ホストしている NSWindow を掴んで、常に最前面（フローティング）に固定する。
+/// 他アプリ（Directory Opus など）にフォーカスを移しても背面に回らないようにする。
+private struct WindowConfigurator: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async { configure(view.window) }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        configure(nsView.window)
+    }
+
+    private func configure(_ window: NSWindow?) {
+        guard let window else { return }
+        // 通常ウィンドウより上のレベルに固定
+        window.level = .floating
+        // フルスクリーンの他アプリや全 Space 上でも表示されるようにする
+        window.collectionBehavior.insert(.canJoinAllSpaces)
+        window.collectionBehavior.insert(.fullScreenAuxiliary)
     }
 }

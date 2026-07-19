@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import os.log
 
 /// 動画のトリミング処理をまとめたユーティリティ。
 /// 速度重視のため再エンコードせず、パススルー（ストリームコピー）でカットする。
@@ -57,9 +58,86 @@ enum VideoTrimmer {
     static func trim(sourceURL: URL, start: Double, end: Double, outputURL: URL) async throws {
         guard end > start else { throw TrimError.invalidRange }
 
-        let asset = AVURLAsset(url: sourceURL)
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            try? FileManager.default.removeItem(at: outputURL)
+        }
 
-        // パススルー = 再エンコードなしのストリームコピー（高速）
+        // 出力が 4GB を超えると AVAssetExportSession のパススルーは -16364 で失敗する
+        // （MP4/MOV マルチプレクサの 32bit 制限）。ffmpeg の stream copy は 64bit
+        // atom を書けるため 4GB 超でも切り出せる。ffmpeg があれば優先して使う。
+        if let ffmpeg = ffmpegPath() {
+            try await runFFmpeg(ffmpeg, source: sourceURL, start: start, end: end, output: outputURL)
+        } else {
+            try await runAVExport(source: sourceURL, start: start, end: end, output: outputURL)
+        }
+    }
+
+    // MARK: - ffmpeg（4GB 超対応・再エンコードなし）
+
+    /// よくあるインストール先から ffmpeg を探す。
+    /// GUI アプリは PATH が最小限なので絶対パスで探す必要がある。
+    private static func ffmpegPath() -> String? {
+        let candidates = [
+            "/opt/homebrew/bin/ffmpeg",  // Apple Silicon Homebrew
+            "/usr/local/bin/ffmpeg",     // Intel Homebrew
+            "/opt/local/bin/ffmpeg",     // MacPorts
+            "/usr/bin/ffmpeg",
+        ]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    /// ffmpeg で [start, end] を stream copy で切り出す。
+    private static func runFFmpeg(_ ffmpeg: String, source: URL, start: Double, end: Double, output: URL) async throws {
+        // 進捗ログ（stderr）でパイプが詰まらないよう、一時ファイルへ流す。
+        let logURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("moviecutter-ffmpeg-\(UUID().uuidString).log")
+        FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        let logHandle = try FileHandle(forWritingTo: logURL)
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: ffmpeg)
+        proc.arguments = [
+            "-y",
+            "-ss", String(format: "%.6f", start),   // 入力側シーク（キーフレーム精度・高速）
+            "-i", source.path,
+            "-t", String(format: "%.6f", end - start),
+            "-map", "0:v?", "-map", "0:a?",          // 映像・音声のみ（あれば）コピー
+            "-c", "copy",                            // 再エンコードなし
+            "-avoid_negative_ts", "make_zero",
+            output.path,
+        ]
+        proc.standardError = logHandle
+        proc.standardOutput = logHandle
+
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            proc.terminationHandler = { p in
+                try? logHandle.close()
+                if p.terminationStatus == 0 {
+                    try? FileManager.default.removeItem(at: logURL)
+                    cont.resume()
+                } else {
+                    let log = (try? String(contentsOf: logURL, encoding: .utf8)) ?? ""
+                    try? FileManager.default.removeItem(at: logURL)
+                    let tail = String(log.suffix(800))
+                    os_log("ffmpeg failed code=%d: %{public}@", log: Self.logger, type: .error,
+                           Int(p.terminationStatus), tail)
+                    cont.resume(throwing: TrimError.exportFailed("ffmpeg 失敗 (code \(p.terminationStatus))\n\(tail)"))
+                }
+            }
+            do {
+                try proc.run()
+            } catch {
+                try? logHandle.close()
+                try? FileManager.default.removeItem(at: logURL)
+                cont.resume(throwing: error)
+            }
+        }
+    }
+
+    // MARK: - AVAssetExportSession（ffmpeg 不在時のフォールバック・4GB 未満のみ）
+
+    private static func runAVExport(source: URL, start: Double, end: Double, output: URL) async throws {
+        let asset = AVURLAsset(url: source)
         guard let exportSession = AVAssetExportSession(
             asset: asset,
             presetName: AVAssetExportPresetPassthrough
@@ -67,18 +145,13 @@ enum VideoTrimmer {
             throw TrimError.noExportSession
         }
 
-        if FileManager.default.fileExists(atPath: outputURL.path) {
-            try? FileManager.default.removeItem(at: outputURL)
-        }
-
         let timescale: CMTimeScale = 600
-        let startTime = CMTime(seconds: start, preferredTimescale: timescale)
-        let endTime = CMTime(seconds: end, preferredTimescale: timescale)
-        let timeRange = CMTimeRange(start: startTime, end: endTime)
-
-        exportSession.outputURL = outputURL
-        exportSession.outputFileType = fileType(for: outputURL)
-        exportSession.timeRange = timeRange
+        exportSession.outputURL = output
+        exportSession.outputFileType = fileType(for: output)
+        exportSession.timeRange = CMTimeRange(
+            start: CMTime(seconds: start, preferredTimescale: timescale),
+            end: CMTime(seconds: end, preferredTimescale: timescale)
+        )
 
         await exportSession.export()
 
@@ -86,11 +159,26 @@ enum VideoTrimmer {
         case .completed:
             return
         case .failed, .cancelled:
-            let message = exportSession.error?.localizedDescription ?? "不明なエラー"
-            throw TrimError.exportFailed(message)
+            let detail = describe(exportSession.error)
+            os_log("AVExport failed: %{public}@ | %{public}@",
+                   log: Self.logger, type: .error, output.path, detail)
+            // 4GB 超が原因のことが多い旨を添える
+            throw TrimError.exportFailed("\(detail)\n（出力が 4GB を超える場合は ffmpeg のインストールが必要です）")
         default:
             throw TrimError.exportFailed("予期しない状態: \(exportSession.status.rawValue)")
         }
+    }
+
+    private static let logger = OSLog(subsystem: "com.example.MovieCutter", category: "export")
+
+    /// NSError をドメイン・コード・下位エラーまで含めて読める文字列にする。
+    private static func describe(_ error: Error?) -> String {
+        guard let ns = error as NSError? else { return "不明なエラー" }
+        var parts = ["\(ns.localizedDescription) [\(ns.domain) \(ns.code)]"]
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
+            parts.append("← \(underlying.domain) \(underlying.code): \(underlying.localizedDescription)")
+        }
+        return parts.joined(separator: " ")
     }
 
     /// 動画の長さ（秒）を取得する。
