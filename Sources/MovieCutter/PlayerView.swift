@@ -9,7 +9,9 @@ struct PlayerView: NSViewRepresentable {
     func makeNSView(context: Context) -> AVPlayerView {
         let view = AVPlayerView()
         view.player = player
-        view.controlsStyle = .inline
+        // 操作部 (シークバー等) は出さない。再生範囲は開始・終了のスライダーで決め、再生/停止は Space か映像のクリック、
+        // 音量は CutterView の自前の部品で扱う (標準の操作部はシークバーだけを消すことができないため)
+        view.controlsStyle = .none
         view.showsFullScreenToggleButton = false
         return view
     }

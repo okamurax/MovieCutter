@@ -8,6 +8,7 @@ macOS 向けの動画トリミングアプリ（Swift + SwiftUI）。
 
 - macOS 13 以上
 - Swift 6（Command Line Tools でOK。フル版 Xcode は不要）
+- build.sh は macOS 26 の SDK を使う（Command Line Tools の macOS 27 SDK では SwiftUI がビルドできないため）
 
 ## ビルドと起動
 
@@ -41,7 +42,10 @@ swift run
 Package.swift                        SPM 定義
 Sources/MovieCutter/
   MovieCutterApp.swift               アプリのエントリポイント
-  ContentView.swift                  UI（プレビュー・スライダー・書き出し）
+  ContentView.swift                  窓（開く・ドラッグ&ドロップ・外から渡された動画の受け取り・最前面固定）
+  CutterView.swift                   切り出し画面（プレビュー・開始／終了スライダー・音量・書き出し）
+                                     DownloadsShelf のプレビュー欄と共有（あちらはこのファイルを直接ビルドに含める）
+  PlayerView.swift                   AVPlayerView のラッパー（操作部なし）
   VideoTrimmer.swift                 AVFoundation によるトリミング処理
 Resources/Info.plist                 .app バンドル用のメタデータ
 build.sh                             .app バンドル作成スクリプト

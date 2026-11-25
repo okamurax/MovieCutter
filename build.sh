@@ -9,6 +9,10 @@ APP_NAME="MovieCutter"
 BUILD_DIR=".build/${CONFIG}"
 APP_BUNDLE="${APP_NAME}.app"
 
+# コマンドラインツールの macOS 27 SDK は SwiftUI の @State がマクロになり、その部品 (SwiftUIMacros) が入っていないため
+# ビルドできない (2026-11 時点)。26 の SDK に固定する。27 SDK で通るようになったら外す
+export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk
+
 echo "==> Swift ビルド (${CONFIG})"
 swift build -c "${CONFIG}"
 
